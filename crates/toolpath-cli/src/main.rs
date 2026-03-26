@@ -5,6 +5,7 @@ mod cmd_merge;
 mod cmd_query;
 mod cmd_render;
 mod cmd_track;
+mod cmd_tui;
 mod cmd_validate;
 
 use anyhow::Result;
@@ -64,6 +65,16 @@ enum Commands {
         #[command(subcommand)]
         op: cmd_track::TrackOp,
     },
+    /// View a Toolpath Path document interactively
+    View {
+        /// Input file (use - for stdin)
+        input: PathBuf,
+    },
+    /// Interactively redact a Toolpath Path document
+    Redact {
+        /// Input file (use - for stdin)
+        input: PathBuf,
+    },
     /// Validate a Toolpath document
     Validate {
         /// Input file
@@ -84,6 +95,8 @@ fn main() -> Result<()> {
         Commands::Render { format } => cmd_render::run(format),
         Commands::Merge { inputs, title } => cmd_merge::run(inputs, title, cli.pretty),
         Commands::Track { op } => cmd_track::run(op, cli.pretty),
+        Commands::View { input } => cmd_tui::run_view(input),
+        Commands::Redact { input } => cmd_tui::run_redact(input),
         Commands::Validate { input } => cmd_validate::run(input),
         Commands::Haiku => {
             cmd_haiku::run();
