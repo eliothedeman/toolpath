@@ -183,10 +183,24 @@ fn walk_value(
                             value_len,
                         });
                     } else {
-                        // Wrap at continuation_width.
+                        // Wrap at continuation_width, respecting char boundaries.
                         let mut chunk_start = 0;
                         while chunk_start < display.len() {
-                            let chunk_end = (chunk_start + continuation_width).min(display.len());
+                            let target = (chunk_start + continuation_width).min(display.len());
+                            // Find a valid char boundary at or before the target.
+                            let mut chunk_end = target;
+                            while chunk_end > chunk_start && !display.is_char_boundary(chunk_end) {
+                                chunk_end -= 1;
+                            }
+                            if chunk_end == chunk_start {
+                                // Safety: advance to the next char boundary.
+                                chunk_end = target;
+                                while chunk_end < display.len()
+                                    && !display.is_char_boundary(chunk_end)
+                                {
+                                    chunk_end += 1;
+                                }
+                            }
                             let chunk = &display[chunk_start..chunk_end];
                             lines.push(FieldLine {
                                 json_pointer: Some(pointer.to_string()),
@@ -296,10 +310,10 @@ fn build_summary(step: &v1::Step) -> String {
     {
         // Look for conversation.append structural changes.
         for change in step.change.values() {
-            if let Some(ref structural) = change.structural {
-                if structural.change_type == "conversation.append" {
-                    return build_conversation_summary(structural, actor);
-                }
+            if let Some(ref structural) = change.structural
+                && structural.change_type == "conversation.append"
+            {
+                return build_conversation_summary(structural, actor);
             }
         }
         // Fallback: try raw text from any change.
@@ -313,29 +327,29 @@ fn build_summary(step: &v1::Step) -> String {
     // Policy steps.
     if actor == "agent:clash-policy" {
         for change in step.change.values() {
-            if let Some(ref structural) = change.structural {
-                if structural.change_type == "policy_evaluation" {
-                    let effect = structural
-                        .extra
-                        .get("effect")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("?");
-                    let tool = structural
-                        .extra
-                        .get("tool_name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    return format!("{effect} {tool}").trim().to_string();
-                }
+            if let Some(ref structural) = change.structural
+                && structural.change_type == "policy_evaluation"
+            {
+                let effect = structural
+                    .extra
+                    .get("effect")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let tool = structural
+                    .extra
+                    .get("tool_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                return format!("{effect} {tool}").trim().to_string();
             }
         }
     }
 
     // Fallback.
-    if let Some(ref meta) = step.meta {
-        if let Some(ref intent) = meta.intent {
-            return truncate_first_line(intent, 80);
-        }
+    if let Some(ref meta) = step.meta
+        && let Some(ref intent) = meta.intent
+    {
+        return truncate_first_line(intent, 80);
     }
     format!("{} — {}", actor, step.step.id)
 }
@@ -370,7 +384,8 @@ fn build_conversation_summary(structural: &v1::StructuralChange, actor: &str) ->
 
 fn truncate_first_line(s: &str, max: usize) -> String {
     let first_line = s.lines().next().unwrap_or("").trim();
-    if first_line.len() <= max {
+    let char_count = first_line.chars().count();
+    if char_count <= max {
         first_line.to_string()
     } else {
         let truncated: String = first_line.chars().take(max.saturating_sub(1)).collect();
@@ -429,11 +444,11 @@ pub fn compute_graph_layout(steps: &[v1::Step], head_id: &str) -> Vec<GraphLine>
         let is_on_main = ancestor_ids.contains(id);
         let is_dead = !is_on_main;
         let is_leaf = !has_children.contains(id);
-        let has_branch = children_of.get(id).map_or(false, |c| c.len() > 1);
+        let has_branch = children_of.get(id).is_some_and(|c| c.len() > 1);
 
         // If this step merges AND branches, pre-free merged columns so
         // branch children can reuse them immediately.
-        if step.step.parents.len() > 1 && children_of.get(id).map_or(false, |k| k.len() > 1) {
+        if step.step.parents.len() > 1 && children_of.get(id).is_some_and(|k| k.len() > 1) {
             for parent in &step.step.parents {
                 let parent_col = col_of.get(parent.as_str()).copied().unwrap_or(0);
                 if parent_col != my_col && !free_cols.contains(&parent_col) {
@@ -590,12 +605,10 @@ pub fn compute_graph_layout(steps: &[v1::Step], head_id: &str) -> Vec<GraphLine>
 
         // If this step branches, activate all child columns immediately
         // so continuation lines appear between branch point and child.
-        if has_branch {
-            if let Some(kids) = children_of.get(id) {
-                for &kid_idx in kids {
-                    let kid_col = col_of[steps[kid_idx].step.id.as_str()];
-                    active.insert(kid_col);
-                }
+        if has_branch && let Some(kids) = children_of.get(id) {
+            for &kid_idx in kids {
+                let kid_col = col_of[steps[kid_idx].step.id.as_str()];
+                active.insert(kid_col);
             }
         }
 
@@ -710,7 +723,7 @@ mod tests {
         extra.insert("effect".to_string(), serde_json::json!(effect));
         extra.insert("tool_name".to_string(), serde_json::json!(tool_name));
         step.change.insert(
-            "clash://policy/evaluations".to_string(),
+            "toolpath://policy/evaluations".to_string(),
             ArtifactChange {
                 raw: None,
                 structural: Some(StructuralChange {

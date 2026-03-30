@@ -1,6 +1,6 @@
 //! Pure redaction logic: given step entries with redaction state, produce a redacted Document.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use toolpath::v1;
 
@@ -50,7 +50,8 @@ pub fn build_redacted_document(original: &v1::Path, entries: &[StepEntry]) -> v1
             .map(|p| id_remap.get(p).cloned().unwrap_or_else(|| p.clone()))
             .collect();
         // Deduplicate parents (multiple excluded parents may map to same placeholder).
-        step.step.parents.dedup();
+        let mut seen = HashSet::new();
+        step.step.parents.retain(|p| seen.insert(p.clone()));
     }
 
     // Update head.
@@ -84,7 +85,7 @@ fn build_placeholder_step(id: &str, first_excluded: &v1::Step, count: usize) -> 
     let mut extra = HashMap::new();
     extra.insert("count".to_string(), serde_json::json!(count));
     change.insert(
-        "clash://redaction".to_string(),
+        "toolpath://redaction".to_string(),
         v1::ArtifactChange {
             raw: None,
             structural: Some(v1::StructuralChange {
@@ -135,12 +136,12 @@ fn apply_text_redactions(step: &mut v1::Step, redactions: &[crate::model::TextRe
         ranges.sort();
         let mut merged: Vec<(usize, usize)> = Vec::new();
         for (s, e) in ranges {
-            if let Some(last) = merged.last_mut() {
-                if s <= last.1 {
-                    // Overlapping or adjacent — merge.
-                    last.1 = last.1.max(e);
-                    continue;
-                }
+            if let Some(last) = merged.last_mut()
+                && s <= last.1
+            {
+                // Overlapping or adjacent — merge.
+                last.1 = last.1.max(e);
+                continue;
             }
             merged.push((s, e));
         }
@@ -148,18 +149,18 @@ fn apply_text_redactions(step: &mut v1::Step, redactions: &[crate::model::TextRe
         // Apply from the end so earlier offsets remain valid.
         merged.reverse();
 
-        if let Some(target) = value.pointer_mut(pointer) {
-            if let Some(s) = target.as_str().map(|s| s.to_string()) {
-                let mut result = s;
-                for (start, end) in &merged {
-                    if *start <= result.len() && *end <= result.len() && start <= end {
-                        let char_count = end - start;
-                        let replacement = format!("[REDACTED({char_count})]");
-                        result.replace_range(*start..*end, &replacement);
-                    }
+        if let Some(target) = value.pointer_mut(pointer)
+            && let Some(s) = target.as_str().map(|s| s.to_string())
+        {
+            let mut result = s;
+            for (start, end) in &merged {
+                if *start <= result.len() && *end <= result.len() && start <= end {
+                    let char_count = end - start;
+                    let replacement = format!("[REDACTED({char_count})]");
+                    result.replace_range(*start..*end, &replacement);
                 }
-                *target = serde_json::Value::String(result);
             }
+            *target = serde_json::Value::String(result);
         }
     }
 

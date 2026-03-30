@@ -5,7 +5,7 @@
 //! operation. File mutations from tool use (Write, Edit) appear as sibling
 //! artifacts in the same step's `change` map.
 
-use crate::types::{ContentPart, Conversation, MessageContent, MessageRole};
+use crate::types::{ContentPart, Conversation, ConversationEntry, MessageContent, MessageRole};
 use serde_json::json;
 use std::collections::HashMap;
 use toolpath::v1::{
@@ -22,6 +22,200 @@ pub struct DeriveConfig {
     pub include_thinking: bool,
 }
 
+/// The result of deriving a single step from a conversation entry.
+pub struct DerivedStep {
+    /// The toolpath step.
+    pub step: Step,
+    /// The actor key (e.g. `"human:user"` or `"agent:claude-opus-4-6"`).
+    pub actor_key: String,
+    /// The actor definition for this step's actor.
+    pub actor_def: ActorDefinition,
+}
+
+/// Derive a single Toolpath [`Step`] from a Claude conversation entry.
+///
+/// Returns `None` for entries that should be skipped (empty UUID, no message,
+/// system messages, or entries with no text/tool-use/file-change content).
+///
+/// The caller provides `session_id` (used to build the `claude://<session-id>`
+/// artifact key) and `parents` (the parent step IDs for DAG construction).
+///
+/// # Example
+///
+/// ```
+/// use toolpath_claude::derive::{derive_step, DeriveConfig};
+/// use toolpath_claude::types::{ConversationEntry, Message, MessageContent, MessageRole};
+///
+/// let entry = ConversationEntry {
+///     uuid: "abc-123".into(),
+///     timestamp: "2024-01-01T00:00:00Z".into(),
+///     entry_type: "user".into(),
+///     message: Some(Message {
+///         role: MessageRole::User,
+///         content: Some(MessageContent::Text("Fix the bug".into())),
+///         model: None, id: None, message_type: None,
+///         stop_reason: None, stop_sequence: None, usage: None,
+///     }),
+///     parent_uuid: None, is_sidechain: false, session_id: None,
+///     cwd: None, git_branch: None, version: None, user_type: None,
+///     request_id: None, tool_use_result: None, snapshot: None,
+///     message_id: None, extra: Default::default(),
+/// };
+///
+/// let config = DeriveConfig::default();
+/// let result = derive_step(&entry, "session-42", vec![], &config);
+/// assert!(result.is_some());
+///
+/// let derived = result.unwrap();
+/// assert_eq!(derived.step.step.actor, "human:user");
+/// assert!(derived.step.change.contains_key("claude://session-42"));
+/// ```
+pub fn derive_step(
+    entry: &ConversationEntry,
+    session_id: &str,
+    parents: Vec<String>,
+    config: &DeriveConfig,
+) -> Option<DerivedStep> {
+    if entry.uuid.is_empty() {
+        return None;
+    }
+
+    let message = entry.message.as_ref()?;
+
+    let (actor_key, actor_def, role_str) = match message.role {
+        MessageRole::User => (
+            "human:user".to_string(),
+            ActorDefinition {
+                name: Some("User".to_string()),
+                ..Default::default()
+            },
+            "user",
+        ),
+        MessageRole::Assistant => {
+            let (key, model_str) = if let Some(model) = &message.model {
+                (format!("agent:{}", model), model.clone())
+            } else {
+                ("agent:claude-code".to_string(), "claude-code".to_string())
+            };
+            let mut identities = vec![Identity {
+                system: "anthropic".to_string(),
+                id: model_str.clone(),
+            }];
+            if let Some(version) = &entry.version {
+                identities.push(Identity {
+                    system: "claude-code".to_string(),
+                    id: version.clone(),
+                });
+            }
+            let def = ActorDefinition {
+                name: Some("Claude Code".to_string()),
+                provider: Some("anthropic".to_string()),
+                model: Some(model_str),
+                identities,
+                ..Default::default()
+            };
+            (key, def, "assistant")
+        }
+        MessageRole::System => return None,
+    };
+
+    // Collect conversation text and file changes from this turn
+    let mut file_changes: HashMap<String, ArtifactChange> = HashMap::new();
+    let mut text_parts: Vec<String> = Vec::new();
+    let mut tool_uses: Vec<String> = Vec::new();
+
+    match &message.content {
+        Some(MessageContent::Parts(parts)) => {
+            for part in parts {
+                match part {
+                    ContentPart::Text { text } => {
+                        if !text.trim().is_empty() {
+                            text_parts.push(text.clone());
+                        }
+                    }
+                    ContentPart::Thinking { thinking, .. } => {
+                        if config.include_thinking && !thinking.trim().is_empty() {
+                            text_parts.push(format!("[thinking] {}", thinking));
+                        }
+                    }
+                    ContentPart::ToolUse { name, input, .. } => {
+                        tool_uses.push(name.clone());
+                        if let Some(file_path) = input.get("file_path").and_then(|v| v.as_str()) {
+                            match name.as_str() {
+                                "Write" | "Edit" => {
+                                    file_changes.insert(
+                                        file_path.to_string(),
+                                        ArtifactChange {
+                                            raw: None,
+                                            structural: None,
+                                        },
+                                    );
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Some(MessageContent::Text(text)) => {
+            if !text.trim().is_empty() {
+                text_parts.push(text.clone());
+            }
+        }
+        None => {}
+    }
+
+    // Skip entries with no conversation content and no file changes
+    if text_parts.is_empty() && tool_uses.is_empty() && file_changes.is_empty() {
+        return None;
+    }
+
+    // Build the conversation artifact change
+    let convo_artifact = format!("claude://{}", session_id);
+    let mut convo_extra = HashMap::new();
+    convo_extra.insert("role".to_string(), json!(role_str));
+    if !text_parts.is_empty() {
+        let combined = text_parts.join("\n\n");
+        convo_extra.insert("text".to_string(), json!(truncate(&combined, 2000)));
+    }
+    if !tool_uses.is_empty() {
+        convo_extra.insert("tool_uses".to_string(), json!(tool_uses.clone()));
+    }
+
+    let convo_change = ArtifactChange {
+        raw: None,
+        structural: Some(StructuralChange {
+            change_type: "conversation.append".to_string(),
+            extra: convo_extra,
+        }),
+    };
+
+    let mut changes = HashMap::new();
+    changes.insert(convo_artifact, convo_change);
+    changes.extend(file_changes);
+
+    let step_id = format!("step-{}", safe_prefix(&entry.uuid, 8));
+
+    let step = Step {
+        step: StepIdentity {
+            id: step_id,
+            parents,
+            actor: actor_key.clone(),
+            timestamp: entry.timestamp.clone(),
+        },
+        change: changes,
+        meta: None,
+    };
+
+    Some(DerivedStep {
+        step,
+        actor_key,
+        actor_def,
+    })
+}
+
 /// Derive a single Toolpath Path from a Claude conversation.
 ///
 /// The conversation is modeled as an artifact at `claude://<session-id>`.
@@ -30,142 +224,12 @@ pub struct DeriveConfig {
 /// file-level artifacts touched by tool use.
 pub fn derive_path(conversation: &Conversation, config: &DeriveConfig) -> Path {
     let session_short = safe_prefix(&conversation.session_id, 8);
-    let convo_artifact = format!("claude://{}", conversation.session_id);
 
     let mut steps = Vec::new();
     let mut last_step_id: Option<String> = None;
     let mut actors: HashMap<String, ActorDefinition> = HashMap::new();
 
     for entry in &conversation.entries {
-        if entry.uuid.is_empty() {
-            continue;
-        }
-
-        let message = match &entry.message {
-            Some(m) => m,
-            None => continue,
-        };
-
-        let (actor, role_str) = match message.role {
-            MessageRole::User => {
-                actors
-                    .entry("human:user".to_string())
-                    .or_insert_with(|| ActorDefinition {
-                        name: Some("User".to_string()),
-                        ..Default::default()
-                    });
-                ("human:user".to_string(), "user")
-            }
-            MessageRole::Assistant => {
-                let (actor_key, model_str) = if let Some(model) = &message.model {
-                    (format!("agent:{}", model), model.clone())
-                } else {
-                    ("agent:claude-code".to_string(), "claude-code".to_string())
-                };
-                actors.entry(actor_key.clone()).or_insert_with(|| {
-                    let mut identities = vec![Identity {
-                        system: "anthropic".to_string(),
-                        id: model_str.clone(),
-                    }];
-                    if let Some(version) = &entry.version {
-                        identities.push(Identity {
-                            system: "claude-code".to_string(),
-                            id: version.clone(),
-                        });
-                    }
-                    ActorDefinition {
-                        name: Some("Claude Code".to_string()),
-                        provider: Some("anthropic".to_string()),
-                        model: Some(model_str),
-                        identities,
-                        ..Default::default()
-                    }
-                });
-                (actor_key, "assistant")
-            }
-            MessageRole::System => continue,
-        };
-
-        // Collect conversation text and file changes from this turn
-        let mut file_changes: HashMap<String, ArtifactChange> = HashMap::new();
-        let mut text_parts: Vec<String> = Vec::new();
-        let mut tool_uses: Vec<String> = Vec::new();
-
-        match &message.content {
-            Some(MessageContent::Parts(parts)) => {
-                for part in parts {
-                    match part {
-                        ContentPart::Text { text } => {
-                            if !text.trim().is_empty() {
-                                text_parts.push(text.clone());
-                            }
-                        }
-                        ContentPart::Thinking { thinking, .. } => {
-                            if config.include_thinking && !thinking.trim().is_empty() {
-                                text_parts.push(format!("[thinking] {}", thinking));
-                            }
-                        }
-                        ContentPart::ToolUse { name, input, .. } => {
-                            tool_uses.push(name.clone());
-                            if let Some(file_path) = input.get("file_path").and_then(|v| v.as_str())
-                            {
-                                match name.as_str() {
-                                    "Write" | "Edit" => {
-                                        file_changes.insert(
-                                            file_path.to_string(),
-                                            ArtifactChange {
-                                                raw: None,
-                                                structural: None,
-                                            },
-                                        );
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            Some(MessageContent::Text(text)) => {
-                if !text.trim().is_empty() {
-                    text_parts.push(text.clone());
-                }
-            }
-            None => {}
-        }
-
-        // Skip entries with no conversation content and no file changes
-        if text_parts.is_empty() && tool_uses.is_empty() && file_changes.is_empty() {
-            continue;
-        }
-
-        // Build the conversation artifact change
-        let mut convo_extra = HashMap::new();
-        convo_extra.insert("role".to_string(), json!(role_str));
-        if !text_parts.is_empty() {
-            let combined = text_parts.join("\n\n");
-            convo_extra.insert("text".to_string(), json!(truncate(&combined, 2000)));
-        }
-        if !tool_uses.is_empty() {
-            convo_extra.insert("tool_uses".to_string(), json!(tool_uses.clone()));
-        }
-
-        let convo_change = ArtifactChange {
-            raw: None,
-            structural: Some(StructuralChange {
-                change_type: "conversation.append".to_string(),
-                extra: convo_extra,
-            }),
-        };
-
-        let mut changes = HashMap::new();
-        changes.insert(convo_artifact.clone(), convo_change);
-        changes.extend(file_changes);
-
-        // Build step — no meta.intent; the conversation content already
-        // lives in the structural change and adding it again is redundant.
-        let step_id = format!("step-{}", safe_prefix(&entry.uuid, 8));
         let parents = if entry.is_sidechain {
             entry
                 .parent_uuid
@@ -176,21 +240,17 @@ pub fn derive_path(conversation: &Conversation, config: &DeriveConfig) -> Path {
             last_step_id.iter().cloned().collect()
         };
 
-        let step = Step {
-            step: StepIdentity {
-                id: step_id.clone(),
-                parents,
-                actor,
-                timestamp: entry.timestamp.clone(),
-            },
-            change: changes,
-            meta: None,
+        let derived = match derive_step(entry, &conversation.session_id, parents, config) {
+            Some(d) => d,
+            None => continue,
         };
 
+        actors.entry(derived.actor_key).or_insert(derived.actor_def);
+
         if !entry.is_sidechain {
-            last_step_id = Some(step_id);
+            last_step_id = Some(derived.step.step.id.clone());
         }
-        steps.push(step);
+        steps.push(derived.step);
     }
 
     let head = last_step_id.unwrap_or_else(|| "empty".to_string());
